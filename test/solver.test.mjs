@@ -389,6 +389,120 @@ check('缺少某供水点上限被拒绝', ce7.status === 'invalid');
 const ce8 = cap(['S1'], ['B'], { S1: 1 }, { B: '2' });
 check('字符串需求量被拒绝', ce8.status === 'invalid');
 
+// ============ 重点出口优先配水 ============
+console.log('重点出口优先配水：');
+
+const prio = (supplies, outlets, priorityOutlets, supplyCaps, outletDemands) =>
+  solver.verifyPriorityCapacity(network, { supplies, outlets, supplyCaps, outletDemands, priorityOutlets });
+const prioRow = (r, name) => r.rows.find((x) => x.outlet === name);
+
+// 与核验同一数值（c1）：总入环能力 V01/V02 = 2，B 挂单管 V08 最多 1
+const p0 = prio(['S1', 'S2'], ['B', 'C', 'D'], [], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('未选重点时返回 ok', p0.status === 'ok');
+check('未选重点时第一级目标值为 0', p0.priorityAllocated === 0 && p0.priorityOutletCount === 0);
+check('未选重点时总获配与普通核验一致（2）', p0.totalAllocated === c1.totalAllocated);
+check('未选重点时全部行标记为普通', p0.rows.every((x) => x.category === 'normal'));
+check('未选重点时普通获配即总获配', p0.normalAllocated === 2);
+
+const p1 = prio(['S1', 'S2'], ['B', 'C', 'D'], ['B'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('B 为重点时返回 ok', p1.status === 'ok');
+check('第一级：B 受单管 V08 限制最多获配 1', p1.priorityAllocated === 1 && prioRow(p1, 'B').allocated === 1);
+check('第二级：总获配仍为 2（重点不减）', p1.totalAllocated === 2);
+check('第二级增量全部给普通出口（C+D=1）', p1.normalAllocated === 1 &&
+  prioRow(p1, 'C').allocated + prioRow(p1, 'D').allocated === 1);
+check('行类别标记正确', prioRow(p1, 'B').category === 'priority' &&
+  prioRow(p1, 'C').category === 'normal' && prioRow(p1, 'D').category === 'normal');
+check('B 缺口 1、重点缺口合计 1', prioRow(p1, 'B').shortfall === 1 && p1.priorityShortfall === 1);
+
+// C、D 为重点：普通核验中 B 会占掉 1 个入环单位；优先配水应把两个入环单位
+// 全部让给 C、D（各 1），普通出口 B 获配 0
+const p2 = prio(['S1', 'S2'], ['B', 'C', 'D'], ['C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('第一级：C、D 合计获配 2（优先于 B）', p2.priorityAllocated === 2 &&
+  prioRow(p2, 'C').allocated === 1 && prioRow(p2, 'D').allocated === 1);
+check('重点已足额（重点缺口 0）', p2.priorityShortfall === 0);
+check('第二级：总获配 2，普通出口 B 让管获配 0', p2.totalAllocated === 2 && prioRow(p2, 'B').allocated === 0);
+check('总缺口仍为 2（B 缺 2）', p2.totalShortfall === 2);
+
+console.log('优先配水：第二阶段经残量网络改派已有流量（避免虚假缺口）：');
+// S 经 su/sv 两条单位管分别接 u、v；P（重点）可由 u 或 v 供水，C（普通）只能由 u 供水。
+// 第一阶段最大流取 S→u→P 占住 su 与 up；第二阶段增广路 S→v→P→u→C 穿过重点流的反向弧，
+// 把 P 改派到 v 侧、腾出 u 侧给 C：重点仍为 1，总获配 2。
+// 若逐出口占管且不允许改派，会错误报出 C 缺口 1（总获配仅 1）。
+const rerouteNet = {
+  nodes: ['S', 'u', 'v', 'P', 'C'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'su', from: 'S', to: 'u', open: true },
+    { id: 'sv', from: 'S', to: 'v', open: true },
+    { id: 'up', from: 'u', to: 'P', open: true },
+    { id: 'vp', from: 'v', to: 'P', open: true },
+    { id: 'uc', from: 'u', to: 'C', open: true },
+  ],
+};
+const p3 = solver.verifyPriorityCapacity(rerouteNet, {
+  supplies: ['S'], outlets: ['P', 'C'], priorityOutlets: ['P'],
+  supplyCaps: { S: 5 }, outletDemands: { P: 1, C: 1 },
+});
+const p3plain = solver.verifyCapacity(rerouteNet, {
+  supplies: ['S'], outlets: ['P', 'C'],
+  supplyCaps: { S: 5 }, outletDemands: { P: 1, C: 1 },
+});
+check('残量改派场景返回 ok', p3.status === 'ok');
+check('第一级重点 P 获配 1', p3.priorityAllocated === 1 && prioRow(p3, 'P').allocated === 1);
+check('第二级经改派后普通 C 也获配 1（无虚假缺口）', prioRow(p3, 'C').allocated === 1);
+check('总获配为 2，与无重点普通核验一致', p3.totalAllocated === 2 && p3.totalAllocated === p3plain.totalAllocated);
+check('两个出口均足额、总缺口 0', p3.totalShortfall === 0 && p3.rows.every((x) => x.fullySupplied));
+
+console.log('优先配水：重点本身无法足额时：');
+const p4net = {
+  nodes: ['S', 'P', 'X'],
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'P', open: true }],
+};
+const p4 = solver.verifyPriorityCapacity(p4net, {
+  supplies: ['S'], outlets: ['P', 'X'], priorityOutlets: ['P'],
+  supplyCaps: { S: 9 }, outletDemands: { P: 5, X: 2 },
+});
+check('重点经单管最多获配 1', p4.status === 'ok' && p4.priorityAllocated === 1 && p4.priorityShortfall === 4);
+check('总获配同为 1（X 不通为 0）', p4.totalAllocated === 1 && prioRow(p4, 'X').allocated === 0);
+
+console.log('优先配水：与普通核验总获配一致（多网络对照）：');
+for (const [net, q] of [
+  [bigNet, { supplies: ['SA', 'SB'], outlets: ['O'], priorityOutlets: ['O'], supplyCaps: { SA: 2, SB: 1 }, outletDemands: { O: 100 } }],
+  [c3net, { supplies: ['SA', 'SB'], outlets: ['OA', 'OB', 'OC'], priorityOutlets: ['OA'], supplyCaps: { SA: 5, SB: 5 }, outletDemands: { OA: 1, OB: 1, OC: 1 } }],
+  [cutCapNet, { supplies: ['S'], outlets: ['O'], priorityOutlets: ['O'], supplyCaps: { S: 5 }, outletDemands: { O: 3 } }],
+  [sharedNet, { supplies: ['S1', 'S2'], outlets: ['O'], priorityOutlets: ['O'], supplyCaps: { S1: 5, S2: 5 }, outletDemands: { O: 5 } }],
+]) {
+  const plain = solver.verifyCapacity(net, q);
+  const pri = solver.verifyPriorityCapacity(net, q);
+  check(`重点场景总获配 ${pri.totalAllocated} 等于普通核验 ${plain.totalAllocated}`,
+    pri.status === 'ok' && pri.totalAllocated === plain.totalAllocated);
+}
+
+console.log('优先配水：校验与纯函数：');
+const pe1 = prio(['S1'], ['B'], ['NOPE'], { S1: 1 }, { B: 1 });
+check('重点出口不在名单中报错', pe1.status === 'invalid' && pe1.errors.some((e) => e.includes('不在保供出口名单')));
+const pe2 = solver.verifyPriorityCapacity(network, {
+  supplies: ['S1'], outlets: ['B'], priorityOutlets: 'B',
+  supplyCaps: { S1: 1 }, outletDemands: { B: 1 },
+});
+check('重点名单不是数组时报错', pe2.status === 'invalid');
+const pe3 = prio(['NOPE'], ['B'], ['B'], { NOPE: 1 }, { B: 1 });
+check('沿用核验校验：供水点不存在时报错', pe3.status === 'invalid');
+const pe4 = prio(['S1'], ['B'], ['B'], { S1: -1 }, { B: 1 });
+check('沿用核验校验：负整数上限被拒绝', pe4.status === 'invalid');
+const pe5 = solver.verifyCapacity(network, {
+  supplies: ['S1', 'S2'], outlets: ['B'], priorityOutlets: ['B'],
+  supplyCaps: { S1: 2, S2: 2 }, outletDemands: { B: 3 },
+});
+check('普通核验忽略重点字段，结果不受影响', pe5.status === 'ok' && pe5.totalAllocated === 1);
+const beforePrio = JSON.stringify(network);
+prio(['S1', 'S2'], ['B', 'C', 'D'], ['B', 'C'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('优先配水不修改输入网络与数值', JSON.stringify(network) === beforePrio);
+// 重点名单重复时按去重处理，不报错
+const pe6 = prio(['S1'], ['B'], ['B', 'B'], { S1: 1 }, { B: 1 });
+check('重复重点出口去重处理', pe6.status === 'ok' && pe6.priorityOutletCount === 1);
+
 // ============ 管段增容建议 ============
 console.log('管段增容建议：');
 

@@ -127,6 +127,11 @@ export interface CapacityQuery {
   supplyCaps: Record<string, number>;
   /** 保供出口节点名 -> 需求量（非负整数） */
   outletDemands: Record<string, number>;
+  /**
+   * 重点保供出口节点名（须包含在 outlets 中），缺省或空数组表示全部按普通出口处理。
+   * 仅「重点出口优先配水」使用；供水能力核验与增容建议忽略本字段。
+   */
+  priorityOutlets?: string[];
 }
 
 /** 最小割项目类型：供水点供给上限 / 连通管段 / 出口需求。 */
@@ -183,6 +188,53 @@ export interface CapacityInvalid {
 }
 
 export type CapacityResult = CapacityOk | CapacityInvalid;
+
+// ============ 重点出口优先配水 ============
+
+/** 出口配水类别：重点（优先满足）/ 普通。 */
+export type OutletCategory = 'priority' | 'normal';
+
+export interface PriorityCapacityOutletRow {
+  outlet: string;
+  /** 重点 / 普通 */
+  category: OutletCategory;
+  demand: number;
+  /** 两级目标下该出口获配量 */
+  allocated: number;
+  /** 缺口 = 需求量 - 获配量 */
+  shortfall: number;
+  fullySupplied: boolean;
+}
+
+export interface PriorityCapacityOk {
+  status: 'ok';
+  /** 参与输水的管段总数（无阀管段 + 当前开启的带阀管段；自环不计） */
+  activePipeCount: number;
+  /** 重点出口数 */
+  priorityOutletCount: number;
+  totalSupplyCap: number;
+  totalDemand: number;
+  /** 第一级目标值：重点出口总获配量（在该模型下可达到的最大值） */
+  priorityAllocated: number;
+  /** 重点出口总需求与总缺口 */
+  priorityDemand: number;
+  priorityShortfall: number;
+  /** 第二级目标值：在不减少重点总获配的前提下，全部出口总获配量（最大） */
+  totalAllocated: number;
+  /** 普通出口总获配量（= 总获配 - 重点获配） */
+  normalAllocated: number;
+  /** 总缺口 = 总需求 - 总获配 */
+  totalShortfall: number;
+  /** 按填写表顺序给出的各出口类别、获配量与缺口 */
+  rows: PriorityCapacityOutletRow[];
+}
+
+export interface PriorityCapacityInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type PriorityCapacityResult = PriorityCapacityOk | PriorityCapacityInvalid;
 
 // ============ 管段增容建议 ============
 
@@ -1090,9 +1142,133 @@ export function verifyCapacity(network: Network, query: CapacityQuery): Capacity
   };
 }
 
+/**
+ * 重点出口优先配水：沿用供水能力核验的全部建模（当前阀门状态、供给上限、出口需求、
+ * 无向管段双向共享容量 1），做两级字典序最大化：
+ *   1. 先使「重点出口」总获配量最大；
+ *   2. 再在不减少该值的前提下，使全部出口总获配量最大。
+ *
+ * 实现为同一网络上的两阶段连续增广：
+ * - 第一阶段：网络中只挂「重点出口 → 汇点」的需求弧（普通出口不接汇点），
+ *   求一次最大流，其值即重点出口能拿到的最大总量；
+ * - 第二阶段：在第一阶段的残量网络上补挂「普通出口 → 汇点」需求弧，再求一次
+ *   最大流继续增广。残量网络保留了第一阶段全部已分配流量及其反向回退弧，
+ *   因此第二阶段的增广路可以穿过重点出口附近的反向弧、把第一阶段占用的管段
+ *   「改派」给其他路径（即允许重新调度已有流量），避免逐出口贪心占管造成的
+ *   虚假缺口。增广路始终终于某条出口汇点弧，且第二阶段不存在从源点经重点出口
+ *   汇点弧到达汇点的增广路（否则与第一阶段已达重点最大流矛盾），故重点出口
+ *   各汇点弧上的流量在第二阶段保持不变，第一级目标值必然不减少。
+ * 当没有任何重点出口时，第一阶段值为 0，第二阶段即普通核验的最大流，
+ * 总获配量与 verifyCapacity 完全一致。纯函数，不修改输入。
+ */
+export function verifyPriorityCapacity(network: Network, query: CapacityQuery): PriorityCapacityResult {
+  const { valid, errors } = validateCapacityQuery(network, query);
+  if (!valid) return { status: 'invalid', errors };
+  const { supplyCapList, demandList } = valid;
+
+  // 重点出口名单校验：必须是字符串数组，且每个重点出口都在保供出口名单内
+  const priorityErrors: string[] = [];
+  const rawPriority = query.priorityOutlets;
+  if (rawPriority !== undefined && !asStringArray(rawPriority)) {
+    priorityErrors.push('重点出口名单必须是字符串数组。');
+  }
+  const outletSet = new Set(demandList.map((d) => d.outlet));
+  const priorityOutlets: string[] = [];
+  if (Array.isArray(rawPriority)) {
+    for (const o of uniquePreservingOrder(rawPriority)) {
+      if (!outletSet.has(o)) {
+        priorityErrors.push(`重点出口「${o}」不在保供出口名单中，请先在保供出口中填写并勾选重点。`);
+      } else {
+        priorityOutlets.push(o);
+      }
+    }
+  }
+  if (priorityErrors.length > 0) return { status: 'invalid', errors: priorityErrors };
+
+  const prioritySet = new Set(priorityOutlets);
+
+  const edges = collectActiveEdges(network);
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+
+  const dinic = new CapacityDinic(network.nodes.length);
+  const S = dinic.source;
+  const T = dinic.sink;
+
+  for (const { supply, cap } of supplyCapList) {
+    dinic.addArc(S, indexOf.get(supply)!, cap);
+  }
+  for (const e of edges) {
+    const u = indexOf.get(e.from)!;
+    const v = indexOf.get(e.to)!;
+    dinic.addUndirectedShared(u, v, 1);
+  }
+
+  // 第一阶段：只挂重点出口汇点弧，使重点总获配最大
+  const priorityArcIndex = new Map<number, string>();
+  for (const { outlet, demand } of demandList) {
+    if (!prioritySet.has(outlet)) continue;
+    const arc = dinic.addArc(indexOf.get(outlet)!, T, demand);
+    priorityArcIndex.set(arc, outlet);
+  }
+  const priorityAllocated = dinic.maxFlow(S, T);
+
+  // 第二阶段：在同一残量网络上补挂普通出口汇点弧继续增广（允许改派第一阶段流量）
+  const normalArcIndex = new Map<number, string>();
+  for (const { outlet, demand } of demandList) {
+    if (prioritySet.has(outlet)) continue;
+    const arc = dinic.addArc(indexOf.get(outlet)!, T, demand);
+    normalArcIndex.set(arc, outlet);
+  }
+  const secondStageGain = dinic.maxFlow(S, T);
+  const totalAllocated = priorityAllocated + secondStageGain;
+
+  const allocatedByOutlet = new Map<string, number>();
+  for (const [arc, outlet] of priorityArcIndex) {
+    allocatedByOutlet.set(outlet, dinic.arcFlow(arc));
+  }
+  for (const [arc, outlet] of normalArcIndex) {
+    allocatedByOutlet.set(outlet, dinic.arcFlow(arc));
+  }
+
+  const rows: PriorityCapacityOutletRow[] = demandList.map(({ outlet, demand }) => {
+    const allocated = allocatedByOutlet.get(outlet) ?? 0;
+    return {
+      outlet,
+      category: prioritySet.has(outlet) ? 'priority' : 'normal',
+      demand,
+      allocated,
+      shortfall: demand - allocated,
+      fullySupplied: allocated >= demand,
+    };
+  });
+
+  const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
+  const totalSupplyCap = sum(supplyCapList.map((x) => x.cap));
+  const totalDemand = sum(demandList.map((x) => x.demand));
+  const priorityDemand = sum(demandList.filter((d) => prioritySet.has(d.outlet)).map((d) => d.demand));
+  const normalAllocated = sum(
+    rows.filter((r) => r.category === 'normal').map((r) => r.allocated)
+  );
+
+  return {
+    status: 'ok',
+    activePipeCount: edges.length,
+    priorityOutletCount: priorityOutlets.length,
+    totalSupplyCap,
+    totalDemand,
+    priorityAllocated,
+    priorityDemand,
+    priorityShortfall: priorityDemand - priorityAllocated,
+    totalAllocated,
+    normalAllocated,
+    totalShortfall: totalDemand - totalAllocated,
+    rows,
+  };
+}
+
 /** 增容方案取舍：总获配量最高 → 改造条数最少 → 管段编号（升序）列表字典序最小。 */
-function compareExpansionPlans(a: ExpansionPlan, b: ExpansionPlan): number {
-  if (a.totalAllocated !== b.totalAllocated) return b.totalAllocated - a.totalAllocated;
+function compareExpansionPlans(a: ExpansionPlan, b: ExpansionPlan): number {  if (a.totalAllocated !== b.totalAllocated) return b.totalAllocated - a.totalAllocated;
   if (a.upgraded.length !== b.upgraded.length) return a.upgraded.length - b.upgraded.length;
   for (let i = 0; i < a.upgraded.length; i++) {
     if (a.upgraded[i] !== b.upgraded[i]) return a.upgraded[i] < b.upgraded[i] ? -1 : 1;

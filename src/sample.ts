@@ -51,3 +51,6 @@ export const SAMPLE_OUTLET_DEMANDS: Record<string, number> = {
   咖啡厅: 1,
   卫生间: 2,
 };
+
+/** 示例重点出口优先配水：展厅B 为重点保供出口，其余为普通。 */
+export const SAMPLE_PRIORITY_OUTLETS: string[] = ['展厅B'];

@@ -327,6 +327,33 @@ p code {
   font-size: 0.95rem;
 }
 
+/* 保供出口行：名称 / 需求量 / 重点-普通 选择 */
+.cap-row-outlet {
+  grid-template-columns: minmax(0, 1fr) 110px 76px;
+}
+
+.cap-row select {
+  width: 76px;
+  padding: 6px 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.9rem;
+  background: #fff;
+  color: var(--text);
+}
+
+.tag-priority {
+  background: #fdecea;
+  color: var(--bad);
+  border: 1px solid #f5c6c0;
+}
+
+.tag-normal {
+  background: #eef1f4;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
 .cut-list {
   list-style: none;
   margin: 8px 0;
