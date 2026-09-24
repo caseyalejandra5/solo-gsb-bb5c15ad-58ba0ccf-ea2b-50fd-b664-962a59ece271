@@ -389,6 +389,103 @@ check('缺少某供水点上限被拒绝', ce7.status === 'invalid');
 const ce8 = cap(['S1'], ['B'], { S1: 1 }, { B: '2' });
 check('字符串需求量被拒绝', ce8.status === 'invalid');
 
+// ============ 重点出口优先配水 ============
+console.log('重点出口优先配水：');
+
+const pri = (net, supplies, outlets, supplyCaps, outletDemands, priorityOutlets) =>
+  solver.prioritizeCapacity(net, { supplies, outlets, supplyCaps, outletDemands, priorityOutlets });
+const priRow = (r, name) => r.rows.find((x) => x.outlet === name);
+
+// 残量改派场景：S1 经远路（V1—A—V5—X）、S2 经近路（V2—X）都能供重点 O1（X—V3—O1），
+// 而 S2 是普通出口 O2 的唯一水源（V4）。第一阶段最大流必经近路 S2—V2—X—V3—O1
+// 占用 S2 上限；第二阶段必须在残量网络上把 O1 改派到 S1、让 S2 转供 O2，
+// 否则（把第一阶段流量固化在管段上）O2 会出现虚假缺口。
+const rerouteNet = {
+  nodes: ['S1', 'S2', 'A', 'X', 'O1', 'O2'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'A', open: true },
+    { id: 'V5', from: 'A', to: 'X', open: true },
+    { id: 'V2', from: 'S2', to: 'X', open: true },
+    { id: 'V3', from: 'X', to: 'O1', open: true },
+    { id: 'V4', from: 'S2', to: 'O2', open: true },
+  ],
+};
+const p1 = pri(rerouteNet, ['S1', 'S2'], ['O1', 'O2'], { S1: 1, S2: 1 }, { O1: 1, O2: 1 }, ['O1']);
+check('优先配水返回 ok', p1.status === 'ok');
+check('第一级：重点 O1 总获配 1', p1.priorityAllocated === 1 && p1.priorityDemand === 1);
+check('第二级：经残量改派后总获配 2（无虚假缺口）', p1.totalAllocated === 2 && p1.totalShortfall === 0);
+check('O1 重点且足额', priRow(p1, 'O1').category === 'priority' &&
+  priRow(p1, 'O1').allocated === 1 && priRow(p1, 'O1').fullySupplied);
+check('O2 普通且获配 1（改派腾出 S2）', priRow(p1, 'O2').category === 'normal' &&
+  priRow(p1, 'O2').allocated === 1 && priRow(p1, 'O2').shortfall === 0);
+
+console.log('优先配水：重点挤占普通（总量不变、分配改变）：');
+// 单一供水点上限 1，两个出口需求各 1：普通核验下排在前面的 O2 获配；
+// 优先配水下重点 O1 先获配，O2 让路
+const squeezeNet = {
+  nodes: ['S', 'M', 'O1', 'O2'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'O1', open: true },
+    { id: 'V3', from: 'M', to: 'O2', open: true },
+  ],
+};
+const pc = solver.verifyCapacity(squeezeNet, {
+  supplies: ['S'], outlets: ['O2', 'O1'],
+  supplyCaps: { S: 1 }, outletDemands: { O2: 1, O1: 1 },
+});
+check('普通核验总获配 1（供给上限 1）', pc.totalAllocated === 1);
+check('普通核验下 O2 获配 1、O1 获配 0', capRow(pc, 'O2').allocated === 1 && capRow(pc, 'O1').allocated === 0);
+const p2 = pri(squeezeNet, ['S'], ['O2', 'O1'], { S: 1 }, { O2: 1, O1: 1 }, ['O1']);
+check('重点 O1 获配 1（普通 O2 让路）', priRow(p2, 'O1').allocated === 1 && priRow(p2, 'O2').allocated === 0);
+check('重点总获配 1、总获配 1（供给上限卡住）', p2.priorityAllocated === 1 && p2.totalAllocated === 1);
+check('总缺口 1（O2 缺口）', p2.totalShortfall === 1 && priRow(p2, 'O2').shortfall === 1);
+
+console.log('优先配水：未选重点时与普通核验一致：');
+// 与核验测试 c1 完全相同的输入，但不选重点出口
+const p3 = pri(network, ['S1', 'S2'], ['B', 'C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 }, []);
+check('返回 ok', p3.status === 'ok');
+check('重点目标值为 0', p3.priorityAllocated === 0 && p3.priorityDemand === 0 && p3.priorityCount === 0);
+check('总获配与普通核验一致（2）', p3.totalAllocated === c1.totalAllocated);
+check('各出口获配与普通核验逐个一致',
+  p3.rows.every((x) => x.allocated === capRow(c1, x.outlet).allocated));
+check('全部出口类别为普通', p3.rows.every((x) => x.category === 'normal'));
+
+console.log('优先配水：全部出口均为重点：');
+const p4 = pri(network, ['S1', 'S2'], ['B', 'C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 }, ['B', 'C', 'D']);
+check('重点获配 = 总获配 = 普通核验（2）',
+  p4.priorityAllocated === 2 && p4.totalAllocated === 2 && p4.totalAllocated === c1.totalAllocated);
+check('全部出口类别为重点', p4.rows.every((x) => x.category === 'priority'));
+
+console.log('优先配水：重点出口仍有缺口（受管段限制）：');
+// 主网络中 B 仅经 V08 单管（V09 已关）：重点 B 最多获配 1，需求 2 → 重点缺口 1
+const p5 = pri(network, ['S1', 'S2'], ['B', 'C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 }, ['B']);
+check('重点 B 获配 1（V08 单管限制）', priRow(p5, 'B').allocated === 1 && p5.priorityAllocated === 1);
+check('重点缺口 1（需求 2 获配 1）', p5.priorityShortfall === 1 && p5.priorityDemand === 2);
+check('总获配 2（普通 C、D 争剩余 1）', p5.totalAllocated === 2);
+check('C、D 合计获配 1', priRow(p5, 'C').allocated + priRow(p5, 'D').allocated === 1);
+
+console.log('优先配水：重点需求为 0：');
+const pz = pri(network, ['S1'], ['B', 'C'], { S1: 5 }, { B: 0, C: 1 }, ['B']);
+check('重点需求 0 时重点获配 0', pz.status === 'ok' && pz.priorityAllocated === 0 && pz.priorityDemand === 0);
+check('普通出口照常获配（C 获配 1）', pz.totalAllocated === 1 && priRow(pz, 'C').allocated === 1);
+
+console.log('优先配水：纯函数与输入校验：');
+const beforePri = JSON.stringify(network);
+pri(network, ['S1', 'S2'], ['B', 'C'], { S1: 2, S2: 2 }, { B: 1, C: 1 }, ['B']);
+check('优先配水不修改输入网络', JSON.stringify(network) === beforePri);
+const pe1 = pri(network, ['S1'], ['B'], { S1: 1 }, { B: 1 }, ['NOPE']);
+check('重点出口不在保供出口中时报错', pe1.status === 'invalid' &&
+  pe1.errors.some((e) => e.includes('不在保供出口列表中')));
+const pe2 = pri(network, ['S1'], ['B'], { S1: -1 }, { B: 1 }, ['B']);
+check('负供给上限被拒绝', pe2.status === 'invalid' && pe2.errors.some((e) => e.includes('非负整数')));
+const pe3 = pri(network, ['S1'], ['B'], { S1: 1 }, {}, ['B']);
+check('缺少需求量被拒绝', pe3.status === 'invalid');
+const pe4 = pri(network, [], ['B'], {}, { B: 1 }, ['B']);
+check('缺少供水点被拒绝', pe4.status === 'invalid');
+
 // ============ 管段增容建议 ============
 console.log('管段增容建议：');
 

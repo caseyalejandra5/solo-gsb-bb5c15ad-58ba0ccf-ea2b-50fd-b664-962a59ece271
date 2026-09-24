@@ -4,15 +4,18 @@ import {
   solve,
   inspectResilience,
   verifyCapacity,
+  prioritizeCapacity,
   suggestExpansion,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
   type Query,
   type CapacityQuery,
+  type PriorityQuery,
   type SolveResult,
   type ResilienceResult,
   type CapacityResult,
+  type PriorityResult,
   type ExpansionResult,
   type ExpansionPlan,
 } from './solver';
@@ -31,7 +34,8 @@ app.innerHTML = `
     <p class="subtitle">
       粘贴管网拓扑 JSON，指定供水点、漏点与保供出口，可自动搜索最优关阀组合，
       也可对各保供出口做「保供韧性巡检」（按当前阀门开闭状态估算使其断水至少需失效的管段数），
-      还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割），
+      还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割）
+      与「重点出口优先配水」（先使重点出口总获配最大，再在不减少该值的前提下使全部出口总获配最大），
       并能给出「管段增容建议」（在当前阀门状态下枚举将参与输水管段容量由 1 提至 2 的改造方案，最多改造两条）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
@@ -66,18 +70,19 @@ app.innerHTML = `
         巡检沿用上方「供水点」与「保供出口」：无阀管段与开启的带阀管段均按单条失效计，
         已关阀不参与；多供水点作为整体，环路及并行管段分别计数。
       </p>
-      <h2>3. 供水能力核验与管段增容</h2>
+      <h2>3. 供水能力核验、重点优先配水与管段增容</h2>
       <p class="hint">
         为每个供水点填写非负整数<strong>供给上限</strong>、为每个保供出口填写非负整数<strong>需求量</strong>，
-        按当前阀门开闭状态求总供给最大分配（每条连通管段容量为 1、同一无向管段双向合计只能占用一次，
-        已关阀不参与）。留空按 0 处理。
+        并可将保供出口标记为<strong>重点</strong>（默认普通）。按当前阀门开闭状态求总供给最大分配
+        （每条连通管段容量为 1、同一无向管段双向合计只能占用一次，已关阀不参与）。留空按 0 处理。
       </p>
       <button id="build-capacity-form" type="button">按上方供水点 / 保供出口生成填写表</button>
       <div id="capacity-form" class="capacity-form">
-        <p class="hint">尚未生成填写表：点击上方按钮后，为各供水点和保供出口填写数值，再点「核验供水能力」。</p>
+        <p class="hint">尚未生成填写表：点击上方按钮后，为各供水点和保供出口填写数值、为重点出口选择类别，再点「核验供水能力」或「重点出口优先配水」。</p>
       </div>
       <div class="button-row">
         <button id="verify-capacity" type="button" class="secondary">核验供水能力</button>
+        <button id="priority-allocate" type="button" class="secondary">重点出口优先配水</button>
         <button id="suggest-expansion" type="button" class="secondary">管段增容建议</button>
       </div>
       <p class="hint">
@@ -111,6 +116,16 @@ app.innerHTML = `
         </div>
       </section>
       <section class="panel result-panel">
+        <h2>重点出口优先配水</h2>
+        <div id="priority-result">
+          <p class="hint">
+            在填写表中将保供出口标记为「重点」（默认普通）后，点击「重点出口优先配水」：
+            先使重点出口总获配量最大，再在不减少该值的前提下使全部出口总获配量最大。
+            这里展示两级目标值及各出口的类别、获配量与缺口，供与「供水能力核验」对照。
+          </p>
+        </div>
+      </section>
+      <section class="panel result-panel">
         <h2>管段增容建议</h2>
         <div id="expansion-result">
           <p class="hint">
@@ -137,6 +152,7 @@ const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
 const capacityFormEl = el<HTMLDivElement>('#capacity-form');
 const capacityResultEl = el<HTMLDivElement>('#capacity-result');
+const priorityResultEl = el<HTMLDivElement>('#priority-result');
 const expansionResultEl = el<HTMLDivElement>('#expansion-result');
 
 /** 已生成填写表对应的供水点 / 保供出口，以及各输入框当前值。 */
@@ -282,12 +298,13 @@ function renderInspection(result: ResilienceResult): void {
     </p>`;
 }
 
-/** 渲染供水能力核验的数值填写表（保留已有同值输入）。 */
+/** 渲染供水能力核验的数值填写表（保留已有同值输入与重点类别选择）。 */
 function buildCapacityForm(
   supplies: string[],
   outlets: string[],
   prevCaps?: Record<string, number>,
-  prevDemands?: Record<string, number>
+  prevDemands?: Record<string, number>,
+  prevPriority?: ReadonlySet<string>
 ): void {
   const valueOr = (map: Record<string, number> | undefined, key: string): string => {
     if (!map) return '';
@@ -312,9 +329,10 @@ function buildCapacityForm(
     )
     .join('');
   const outletInputs = outlets
-    .map(
-      (o) => `
-        <label class="cap-row">
+    .map((o) => {
+      const isPriority = prevPriority?.has(o) ?? false;
+      return `
+        <label class="cap-row cap-row-outlet">
           <span>${escapeHtml(o)}</span>
           <input
             type="number"
@@ -325,8 +343,12 @@ function buildCapacityForm(
             value="${valueOr(prevDemands, o)}"
             placeholder="需求量"
           />
-        </label>`
-    )
+          <select data-priority="${escapeHtml(o)}" aria-label="出口类别">
+            <option value="normal"${isPriority ? '' : ' selected'}>普通</option>
+            <option value="priority"${isPriority ? ' selected' : ''}>重点</option>
+          </select>
+        </label>`;
+    })
     .join('');
   capacityFormEl.innerHTML = `
     <div class="cap-grid">
@@ -335,8 +357,9 @@ function buildCapacityForm(
         ${supplies.length > 0 ? supplyInputs : '<p class="hint">请先在上方填写至少一个供水点。</p>'}
       </div>
       <div>
-        <h3>保供出口需求量</h3>
+        <h3>保供出口需求量与类别</h3>
         ${outlets.length > 0 ? outletInputs : '<p class="hint">请先在上方填写至少一个保供出口。</p>'}
+        ${outlets.length > 0 ? '<p class="hint">类别默认为「普通」；「重点」出口在优先配水中先获配。</p>' : ''}
       </div>
     </div>`;
   capacityFormState = { supplies, outlets };
@@ -381,6 +404,15 @@ function readCapacityNumbers(): {
     if (n !== null) outletDemands[input.dataset.outlet!] = n;
   });
   return { supplyCaps, outletDemands, errors };
+}
+
+/** 读取填写表中类别选为「重点」的保供出口名单（未生成填写表时为空）。 */
+function readPrioritySelection(): string[] {
+  const priorityOutlets: string[] = [];
+  capacityFormEl.querySelectorAll<HTMLSelectElement>('select[data-priority]').forEach((select) => {
+    if (select.value === 'priority') priorityOutlets.push(select.dataset.priority!);
+  });
+  return priorityOutlets;
 }
 
 const CUT_KIND_LABEL: Record<import('./solver').CapacityCutKind, string> = {
@@ -468,6 +500,58 @@ function renderCapacity(result: CapacityResult): void {
       参与输水的管段（无阀管段 + 当前开启的带阀管段）共 ${result.activePipeCount} 条，
       每条容量为 1；同一无向管段双向合计只能占用一次，已关阀不参与。
       最小割项目可能是某个供水点的供给上限、某条管段或某个出口的需求量——它们共同卡住了总供给。
+    </p>`;
+}
+
+function renderPriority(result: PriorityResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(priorityResultEl, '输入有误，无法优先配水：', result.errors);
+    return;
+  }
+
+  const rows = result.rows
+    .map(
+      (o) => `
+      <tr>
+        <td>${escapeHtml(o.outlet)}</td>
+        <td>${
+          o.category === 'priority'
+            ? '<span class="tag tag-priority">重点</span>'
+            : '<span class="tag tag-skip">普通</span>'
+        }</td>
+        <td class="num">${o.demand}</td>
+        <td class="num"><strong>${o.allocated}</strong></td>
+        <td class="num ${o.shortfall > 0 ? 'bad' : 'ok'}">${o.shortfall}</td>
+        <td>${o.fullySupplied ? '<span class="tag tag-ok">足额</span>' : '<span class="tag tag-cut">缺口</span>'}</td>
+      </tr>`
+    )
+    .join('');
+
+  const bannerClass = result.totalShortfall > 0 ? 'warn' : 'success';
+  const banner =
+    result.priorityCount > 0
+      ? `第一级目标：重点出口总获配 <strong>${result.priorityAllocated}</strong> / 重点需求
+         ${result.priorityDemand}（重点缺口 ${result.priorityShortfall}，已最大化）；
+         第二级目标：全部出口总获配 <strong>${result.totalAllocated}</strong> / 总需求
+         ${result.totalDemand}，总缺口 <strong>${result.totalShortfall}</strong>。`
+      : `未选择重点出口，全部出口按普通处理：总获配 <strong>${result.totalAllocated}</strong> /
+         总需求 ${result.totalDemand}，总缺口 <strong>${result.totalShortfall}</strong>，
+         与「供水能力核验」的总获配量一致。`;
+
+  priorityResultEl.innerHTML = `
+    <div class="banner ${bannerClass}">${banner}</div>
+    <table>
+      <thead>
+        <tr><th>保供出口</th><th>类别</th><th>需求量</th><th>获配量</th><th>缺口</th><th>状态</th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p class="hint">
+      两级配水：先只把重点出口接入汇点求最大流（第一级目标值），再把普通出口接入汇点、
+      在残量网络上继续增广（第二级目标值）——已有流量可经管段反向弧改派，
+      不会把第一阶段流量固化在管段上造成虚假缺口，重点总获配严格不减少。
+      参与输水的管段共 ${result.activePipeCount} 条（每条容量 1、双向共享，已关阀不参与），
+      供给上限合计 ${result.totalSupplyCap}。各出口获配量与缺口可与「供水能力核验」面板对照。
     </p>`;
 }
 
@@ -622,6 +706,33 @@ function runCapacity(): void {
   }
 }
 
+function runPriority(): void {
+  try {
+    const network = readNetwork();
+    if (!capacityFormState) {
+      renderErrors(priorityResultEl, '请先填写核验数值：', ['点击「按上方供水点 / 保供出口生成填写表」，为各点填写非负整数并标记重点出口后再配水。']);
+      return;
+    }
+    const { supplyCaps, outletDemands, errors: formErrors } = readCapacityNumbers();
+    if (formErrors.length > 0) {
+      renderErrors(priorityResultEl, '填写有误：', formErrors);
+      return;
+    }
+    // 与供水能力核验共用同一份拓扑、供给上限与出口需求（填写表为权威名单），
+    // 重点名单取自填写表中的类别选择
+    const priorityQuery: PriorityQuery = {
+      supplies: capacityFormState.supplies,
+      outlets: capacityFormState.outlets,
+      supplyCaps,
+      outletDemands,
+      priorityOutlets: readPrioritySelection(),
+    };
+    renderPriority(prioritizeCapacity(network, priorityQuery));
+  } catch (e) {
+    renderErrors(priorityResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 function runExpansion(): void {
   try {
     const network = readNetwork();
@@ -656,12 +767,14 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   run();
   runInspection();
   runCapacity();
+  runPriority();
   runExpansion();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
 el<HTMLButtonElement>('#inspect').addEventListener('click', runInspection);
 el<HTMLButtonElement>('#verify-capacity').addEventListener('click', runCapacity);
+el<HTMLButtonElement>('#priority-allocate').addEventListener('click', runPriority);
 el<HTMLButtonElement>('#suggest-expansion').addEventListener('click', runExpansion);
 el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
   try {
@@ -678,7 +791,7 @@ el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
       ...(outlets.length === 0 ? ['请先在上方填写至少一个保供出口。'] : []),
     ]);
   }
-  // 重新生成时尽量保留同节点已填数值
+  // 重新生成时尽量保留同节点已填数值与重点类别选择
   const prev = readCapacityNumbers();
-  buildCapacityForm(supplies, outlets, prev.supplyCaps, prev.outletDemands);
+  buildCapacityForm(supplies, outlets, prev.supplyCaps, prev.outletDemands, new Set(readPrioritySelection()));
 });

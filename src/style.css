@@ -327,6 +327,27 @@ p code {
   font-size: 0.95rem;
 }
 
+/* 出口行：名称 + 需求量 + 重点/普通类别 */
+.cap-row.cap-row-outlet {
+  grid-template-columns: minmax(0, 1fr) 110px 76px;
+}
+
+.cap-row select {
+  width: 76px;
+  padding: 6px 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: #fff;
+}
+
+.tag-priority {
+  background: #eaf2fd;
+  color: var(--primary-dark);
+  border: 1px solid #b9d5f2;
+}
+
 .cut-list {
   list-style: none;
   margin: 8px 0;
